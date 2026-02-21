@@ -22,7 +22,7 @@ import labscript_utils.properties
 
 from qtutils.qt import QtWidgets
 
-from qtutils import qtlock
+from qtutils import inmain
 
 class PrawnBlasterTab(DeviceTab):
     """BLACS Tab for the PrawnBlaster Device."""
@@ -139,10 +139,8 @@ class PrawnBlasterTab(DeviceTab):
         # Manual mode or aborted
         done_condition = status == 0 or status == 5
 
-        # Update GUI status/clock status widgets
-        with qtlock:
-            self.status_label.setText(f"Status: {status}")
-            self.clock_status_label.setText(f"Clock status: {clock_status}")
+        # Update GUI status/clock status widgets (must run on GUI thread)
+        inmain(self._update_status_labels, status, clock_status)
 
         if notify_queue is not None and done_condition and not waits_pending:
             # Experiment is over. Tell the queue manager about it, then
@@ -151,6 +149,11 @@ class PrawnBlasterTab(DeviceTab):
             notify_queue.put("done")
             self.statemachine_timeout_remove(self.status_monitor)
             self.statemachine_timeout_add(2000, self.status_monitor)
+
+    def _update_status_labels(self, status, clock_status):
+        """Update status labels. Runs on GUI thread via inmain()."""
+        self.status_label.setText(f"Status: {status}")
+        self.clock_status_label.setText(f"Clock status: {clock_status}")
 
     @define_state(MODE_BUFFERED, True)
     def start_run(self, notify_queue):
