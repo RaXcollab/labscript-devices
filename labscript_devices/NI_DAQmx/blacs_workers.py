@@ -44,6 +44,11 @@ class NI_DAQmxOutputWorker(Worker):
         # Reset Device: clears previously added routes etc. Note: is insufficient for
         # some devices, which require power cycling to truly reset.
         DAQmxResetDevice(self.MAX_name)
+        self._latched_lines = []           # populated per-shot from h5 device_properties
+        self._cached_final_values = {}     # saved for post-shot three-layer merge
+        self.initial_values = {}           # saved per-shot from front panel snapshot
+        self.AO_task = None                # initialized before start_manual_mode_tasks
+        self.DO_task = None                # so stop_tasks() can safely no-op on first call
         self.start_manual_mode_tasks()
 
     def stop_tasks(self):
@@ -75,6 +80,8 @@ class NI_DAQmxOutputWorker(Worker):
             raise Exception(dedent(msg) % (major.value, minor.value, patch.value))
 
     def start_manual_mode_tasks(self):
+        # Clean up any existing tasks first (makes this method idempotent):
+        self.stop_tasks()
         # Create tasks:
         if self.num_AO > 0:
             self.AO_task = Task()
@@ -106,6 +113,23 @@ class NI_DAQmxOutputWorker(Worker):
             self.AO_task.StartTask()
         if self.DO_task is not None:
             self.DO_task.StartTask()
+
+    def _ensure_manual_DO_task(self):
+        """Create and start a manual-mode DO task if one doesn't exist.
+        Used for pre-latch writes between queued shots when post_experiment
+        has cleared the tasks without transition_to_manual recreating them.
+        Only creates a DO task (not AO) to avoid an AO glitch."""
+        if self.DO_task is not None:
+            return
+        if not self.ports:
+            return
+        self.DO_task = Task()
+        for port_str in sorted(self.ports, key=split_conn_port):
+            if not self.ports[port_str]['num_lines']:
+                continue
+            con = '%s/%s' % (self.MAX_name, port_str)
+            self.DO_task.CreateDOChan(con, "", DAQmx_Val_ChanForAllLines)
+        self.DO_task.StartTask()
 
     def program_manual(self, front_panel_values):
         written = int32()
@@ -333,11 +357,40 @@ class NI_DAQmxOutputWorker(Worker):
         # Store the initial values in case we have to abort and restore them:
         self.initial_values = initial_values
 
-        # Stop the manual mode output tasks, if any:
-        self.stop_tasks()
+        # Read output tables and latched config from h5 in one open
+        # (properties.get expects an open h5py.File, not a path string):
+        with h5py.File(h5file, 'r') as f:
+            group = f['devices'][device_name]
+            AO_table = group['AO'][:] if 'AO' in group else None
+            DO_table = group['DO'][:] if 'DO' in group else None
+            device_props = properties.get(f, device_name, 'device_properties')
 
-        # Get the data to be programmed into the output tasks:
-        AO_table, DO_table = self.get_output_tables(h5file, device_name)
+        self._latched_lines = [
+            _ensure_str(c) for c in device_props.get('latched_lines', [])
+        ]
+        if self._latched_lines:
+            self.logger.debug('latched_lines = %s', self._latched_lines)
+
+        # Pre-latch: write latched values through program_manual. On the first
+        # shot, the manual task is already running. On queued shots (after
+        # post_experiment cleared tasks), _ensure_manual_DO_task creates one.
+        if self._latched_lines and DO_table is not None:
+            self._ensure_manual_DO_task()
+            latch_values = dict(initial_values)
+            first_row = DO_table[0]
+            for conn in self._latched_lines:
+                port, line = split_conn_DO(conn)
+                port_str = 'port%d' % port
+                if port_str in first_row.dtype.names:
+                    latch_values[conn] = int(bool((1 << line) & int(first_row[port_str])))
+            self.logger.debug(
+                'pre-latch values for latched lines: %s',
+                {c: latch_values[c] for c in self._latched_lines}
+            )
+            self.program_manual(latch_values)
+
+        # Now stop manual tasks — hardware holds the latched values:
+        self.stop_tasks()
 
         # Mirror the clock terminal, if applicable:
         self.set_mirror_clock_terminal_connected(True)
@@ -352,6 +405,15 @@ class NI_DAQmxOutputWorker(Worker):
         final_values = {}
         final_values.update(DO_final_values)
         final_values.update(AO_final_values)
+
+        # Cache final values for post-shot three-layer merge:
+        self._cached_final_values = dict(final_values)
+
+        # Override latched channels' reported final values with their manual-mode
+        # values, so the BLACS GUI shows the correct post-restore state:
+        for conn in self._latched_lines:
+            if conn in initial_values:
+                final_values[conn] = initial_values[conn]
 
         # If we are the wait timeout device, then the final value of the timeout line
         # should be its rearm value:
@@ -397,12 +459,32 @@ class NI_DAQmxOutputWorker(Worker):
         # Remove connections between other terminals, if applicable:
         self.set_connected_terminals_connected(False)
 
+        # Restore latched channels between queued shots. Without this, the
+        # next transition_to_buffered has no running DO task for pre-latching,
+        # and latched outputs (e.g., shutters) stay in their sequence state.
+        if self._latched_lines:
+            self._ensure_manual_DO_task()
+            restore = dict(self.initial_values)
+            restore.update(self._cached_final_values)
+            for conn in self._latched_lines:
+                if conn in self.initial_values:
+                    restore[conn] = self.initial_values[conn]
+            self.logger.debug(
+                'post_experiment latch restore: %s',
+                {c: restore[c] for c in self._latched_lines}
+            )
+            self.program_manual(restore)
+
         return True
     
     def transition_to_manual(self, abort=False):
+        self.logger.info(
+            'transition_to_manual (abort=%s, latched_lines=%s)',
+            abort, self._latched_lines
+        )
         # If aborting, stop output tasks. And program device to manual
         if abort:
-            # We did not call transition_to_manual from post_experiment, stop output 
+            # We did not call transition_to_manual from post_experiment, stop output
             # task accordingly
             npts = uInt64()
             samples = uInt64()
@@ -416,12 +498,32 @@ class NI_DAQmxOutputWorker(Worker):
 
             for task, _, _ in tasks:
                 task.ClearTask()
-        
+
         # Set up manual mode tasks again:
         self.start_manual_mode_tasks()
         if abort:
             # Reprogram the initial states:
+            if self._latched_lines:
+                self.logger.debug(
+                    'abort restore — latched channels: %s',
+                    {c: self.initial_values.get(c) for c in self._latched_lines}
+                )
             self.program_manual(self.initial_values)
+        elif self._latched_lines:
+            # Three-layer merge to restore correct state for each channel type:
+            #   Layer 1: initial_values (baseline — correct for static/manual channels)
+            #   Layer 2: cached_final_values (correct for timed channels — matches GUI)
+            #   Layer 3: initial_values for latched channels (revert to real manual state)
+            restore = dict(self.initial_values)
+            restore.update(self._cached_final_values)
+            for conn in self._latched_lines:
+                if conn in self.initial_values:
+                    restore[conn] = self.initial_values[conn]
+            self.logger.debug(
+                'non-abort latch restore: %s',
+                {c: restore[c] for c in self._latched_lines}
+            )
+            self.program_manual(restore)
 
         return True
 
@@ -438,10 +540,11 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
     def init(self):
         # Create the socket to communicate with the DataReceiver for Plotting
-        self.data_socket = Context().socket(zmq.REQ)
-        self.data_socket.connect(
-            f'tcp://{self.parent_host}:{self.data_receiver_port}'
-        )
+        self._zmq_context = Context()
+        self._data_socket_addr = f'tcp://{self.parent_host}:{self.data_receiver_port}'
+        self.data_socket = self._zmq_context.socket(zmq.REQ)
+        self.data_socket.setsockopt(zmq.LINGER, 0)
+        self.data_socket.connect(self._data_socket_addr)
 
         # Prevent interference between the read callback and the shutdown code:
         self.tasklock = threading.RLock()
@@ -473,6 +576,16 @@ class NI_DAQmxAcquisitionWorker(Worker):
     def shutdown(self):
         if self.task is not None:
             self.stop_task()
+        if self.data_socket is not None:
+            try:
+                self.data_socket.close()
+            except Exception:
+                pass
+        if hasattr(self, '_zmq_context'):
+            try:
+                self._zmq_context.destroy(linger=0)
+            except Exception:
+                pass
 
     def read(self, task_handle, event_type, num_samples, callback_data=None):
         """Called as a callback by DAQmx while task is running. Also called by us to get
@@ -586,6 +699,20 @@ class NI_DAQmxAcquisitionWorker(Worker):
             self.task = None
             self.read_array = None
 
+    def _reset_data_socket(self):
+        """Close and re-create the ZMQ REQ socket. Called after abort to clear
+        any stuck send/recv state from the previous shot. Must only be called
+        when no DAQmx task is running (after stop_task, before start_task)."""
+        self.logger.debug("Resetting data_socket after failure")
+        if self.data_socket is not None:
+            try:
+                self.data_socket.close()
+            except Exception:
+                pass
+        self.data_socket = self._zmq_context.socket(zmq.REQ)
+        self.data_socket.setsockopt(zmq.LINGER, 0)
+        self.data_socket.connect(self._data_socket_addr)
+
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.logger.debug('transition_to_buffered')
 
@@ -686,6 +813,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
                 return True
             if self.buffered_chans is not None:
                 self.stop_task()
+            self._reset_data_socket()
             self.buffered_mode = False
             self.logger.info('transitioning to manual mode, task stopped')
             self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
