@@ -736,19 +736,23 @@ class NI_DAQmxAcquisitionWorker(Worker):
             self.AI_start_delay = self.AI_start_delay_ticks*self.buffered_rate
         self.acquired_data = []
         
+        # Stop the manual mode task FIRST to eliminate callback races on
+        # data_socket. The DAQmx read callback sends on the same socket from a
+        # separate thread, so the task must be stopped before we use the socket.
+        if self.manual_mode_task:
+            self.stop_task()
+
         # Configure the Buffered Mode Real Time Plotting
         shot_length = device_properties.get('stop_time', None)
         acq_points_per_chan = np.array([int(shot_length * self.buffered_rate)]).tobytes()
 
         buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
 
-        self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
-        response = self.data_socket.recv()
-        assert response == b'ok', response
+        with self.tasklock:
+            self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
+            response = self.data_socket.recv()
+            assert response == b'ok', response
 
-        # Stop the manual mode task if it is running and start the buffered mode task:
-        if self.manual_mode_task:
-            self.stop_task()
         self.buffered_mode = True
         self.start_task(self.buffered_chans, self.buffered_rate)
         return {}
@@ -768,9 +772,10 @@ class NI_DAQmxAcquisitionWorker(Worker):
             # prepend data packet with the channels to unpack from raw_data_buffer
             buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
 
-            self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
-            response = self.data_socket.recv()
-            assert response == b'ok', response
+            with self.tasklock:
+                self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
+                response = self.data_socket.recv()
+                assert response == b'ok', response
 
         self.buffered_mode = False
         self.logger.info('processing acquired data, task stopped')
@@ -830,9 +835,10 @@ class NI_DAQmxAcquisitionWorker(Worker):
             
             manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
             
-            self.data_socket.send_multipart([b'max_plot_points', manual_chans_json, max_manual_mode_points])
-            response = self.data_socket.recv()
-            assert response == b'ok', response
+            with self.tasklock:
+                self.data_socket.send_multipart([b'max_plot_points', manual_chans_json, max_manual_mode_points])
+                response = self.data_socket.recv()
+                assert response == b'ok', response
 
             if not self.task:
                 self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
