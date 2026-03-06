@@ -544,6 +544,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
         self._data_socket_addr = f'tcp://{self.parent_host}:{self.data_receiver_port}'
         self.data_socket = self._zmq_context.socket(zmq.REQ)
         self.data_socket.setsockopt(zmq.LINGER, 0)
+        self.data_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1s timeout for local IPC
         self.data_socket.connect(self._data_socket_addr)
 
         # Prevent interference between the read callback and the shutdown code:
@@ -612,14 +613,15 @@ class NI_DAQmxAcquisitionWorker(Worker):
                 # Append to the list of acquired data:
                 self.acquired_data.append(data)
             else:
-                # TODO: Send it to the broker thingy.
-                # TODO: is pickling the list more efficient than numpy/json?
-                # prepend data packet with the channels to unpack from raw_data_buffer
+                # Send manual mode data to DataReceiver for real-time plotting.
+                # 1s timeout — local IPC, non-critical plotting data.
                 manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
-
-                self.data_socket.send_multipart([manual_chans_json, data])
-                response = self.data_socket.recv()
-                assert response == b'ok', response
+                try:
+                    self._send_data([manual_chans_json, data])
+                except Exception:
+                    # Must not raise in DAQmx callback thread — would be catastrophic.
+                    # Timeout/reset is already logged by _send_data.
+                    pass
         return 0
 
     def start_task(self, chans, rate):
@@ -700,10 +702,12 @@ class NI_DAQmxAcquisitionWorker(Worker):
             self.read_array = None
 
     def _reset_data_socket(self):
-        """Close and re-create the ZMQ REQ socket. Called after abort to clear
-        any stuck send/recv state from the previous shot. Must only be called
-        when no DAQmx task is running (after stop_task, before start_task)."""
-        self.logger.debug("Resetting data_socket after failure")
+        """Close and re-create the ZMQ REQ socket to clear stuck REQ/REP state.
+
+        Called after abort or after a zmq.Again timeout to recover the socket.
+        Caller must hold self.tasklock (or ensure no DAQmx task is running).
+        """
+        self.logger.debug("Resetting data_socket")
         if self.data_socket is not None:
             try:
                 self.data_socket.close()
@@ -711,7 +715,36 @@ class NI_DAQmxAcquisitionWorker(Worker):
                 pass
         self.data_socket = self._zmq_context.socket(zmq.REQ)
         self.data_socket.setsockopt(zmq.LINGER, 0)
+        self.data_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1s timeout for local IPC
         self.data_socket.connect(self._data_socket_addr)
+
+    def _send_data(self, parts, timeout_ms=1000):
+        """Send data to the DataReceiver via ZMQ REQ socket with timeout recovery.
+
+        Caller must hold self.tasklock — this method does not acquire it.
+
+        On zmq.Again (timeout), resets the socket to clear stuck REQ/REP state
+        and logs a warning. Returns True on success, False on timeout.
+
+        Args:
+            parts: list of message parts for send_multipart
+            timeout_ms: receive timeout in milliseconds (1s for manual/transition,
+                        5s for post_experiment which sends full-shot data)
+        """
+        # Apply per-call timeout if different from current setting
+        self.data_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        try:
+            self.data_socket.send_multipart(parts)
+            response = self.data_socket.recv()
+            assert response == b'ok', response
+            return True
+        except zmq.Again:
+            self.logger.warning(
+                'data_socket timeout (%dms) — DataReceiver may not be ready, '
+                'resetting socket', timeout_ms
+            )
+            self._reset_data_socket()
+            return False
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.logger.debug('transition_to_buffered')
@@ -748,10 +781,11 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
         buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
 
+        # Configure buffered mode plotting — 1s timeout, local IPC
         with self.tasklock:
-            self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
-            response = self.data_socket.recv()
-            assert response == b'ok', response
+            self._send_data(
+                [b'max_plot_points', buffered_chans_json, acq_points_per_chan]
+            )
 
         self.buffered_mode = True
         self.start_task(self.buffered_chans, self.buffered_rate)
@@ -767,15 +801,14 @@ class NI_DAQmxAcquisitionWorker(Worker):
         if self.buffered_chans is not None:
             self.stop_task()
 
-            # TODO: is pickling the list more efficient than numpy/json?
             raw_data_buffer = np.concatenate(self.acquired_data).tobytes()
-            # prepend data packet with the channels to unpack from raw_data_buffer
             buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
 
+            # 5s timeout — full-shot data payload can be large
             with self.tasklock:
-                self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
-                response = self.data_socket.recv()
-                assert response == b'ok', response
+                self._send_data(
+                    [buffered_chans_json, raw_data_buffer], timeout_ms=5000
+                )
 
         self.buffered_mode = False
         self.logger.info('processing acquired data, task stopped')
@@ -830,15 +863,14 @@ class NI_DAQmxAcquisitionWorker(Worker):
         else:
             self.logger.info('transitioning to manual mode')
             
-            # Configure the Manual Mode Real-Time Plotting
-            max_manual_mode_points = np.array([int(10000)]).tobytes() # TODO: set a proper value
-            
+            # Configure manual mode plotting — 1s timeout, local IPC
+            max_manual_mode_points = np.array([int(10000)]).tobytes()
             manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
-            
+
             with self.tasklock:
-                self.data_socket.send_multipart([b'max_plot_points', manual_chans_json, max_manual_mode_points])
-                response = self.data_socket.recv()
-                assert response == b'ok', response
+                self._send_data(
+                    [b'max_plot_points', manual_chans_json, max_manual_mode_points]
+                )
 
             if not self.task:
                 self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
