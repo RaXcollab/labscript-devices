@@ -281,7 +281,7 @@ class IMAQdxCameraServer(CameraServer):
                 print('No camera exposures in this shot.')
                 self.n_images = 0
                 return
-            self.exposures = group['EXPOSURES'].value
+            self.exposures = group['EXPOSURES'][()]   # was .value (removed in h5py 3.0)
             self.n_images = len(group['EXPOSURES'])
 
             # Get the imaqdx_properties from the device_properties
@@ -294,7 +294,7 @@ class IMAQdxCameraServer(CameraServer):
 
             # Get the stop time of the experiment
             devices = [self.camera_name.encode()]
-            connection_table = h5_file['/connection table'].value
+            connection_table = h5_file['/connection table'][()]   # was .value (removed in h5py 3.0)
             try:
                 while not devices[-1] == b'None' and len(devices) < len(connection_table):
                     parent_device = connection_table[connection_table['name'] == devices[-1]]['parent'][0]
@@ -444,7 +444,7 @@ if __name__ == '__main__':
     server_kwargs = {}
     for option in ['image_path', 'named_exposures', 'imageify']:
         if lc.get('imaqdx_server', option, fallback=None):
-            if option is 'image_path':
+            if option == 'image_path':   # was `is` — relies on CPython interning, officially wrong (SyntaxWarning in 3.8+)
                 val = lc.get('imaqdx_server', option)
             else:
                 val = lc.getboolean('imaqdx_server', option)

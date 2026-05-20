@@ -514,7 +514,7 @@ class GuilessWorker(Worker):
             command = self.acquisition_queue.get()
             assert command == 'start'
             #print("acquisition thread: starting new acquisition")
-            start = time.clock()               # Keep track of when acquisition started
+            start = time.perf_counter()        # Keep track of when acquisition started (time.clock removed in Py 3.8)
             # This is a fresh trip through the acquisition loop, no exception has occurred yet!
             self.acquisition_exception = None
             self.acquisition_done.clear()      # I don't understand why this is needed here!
@@ -644,8 +644,8 @@ class GuilessWorker(Worker):
     def shutdown(self):
         if self.aborting:
             print('Shutdown requested during abort; waiting 10 seconds.')
-            start = time.clock()
-            while self.aborting and time.clock() - start < 10:
+            start = time.perf_counter()
+            while self.aborting and time.perf_counter() - start < 10:
                 time.sleep(0.5)
         if self.aborting:
             print('Proceeding in lieu of complete abort.')
