@@ -132,9 +132,21 @@ class PrawnBlasterTab(DeviceTab):
 
         """
 
-        status, clock_status, waits_pending = yield (
+        status_result = yield (
             self.queue_work(self.primary_worker, "check_status")
         )
+
+        # A None result means the worker skipped the status read (its serial
+        # port is closed during BLACS shutdown/restart teardown) or the worker
+        # call raised. Either way there is nothing to report: skip this poll
+        # rather than crash the mainloop by unpacking a non-iterable. This
+        # closes a teardown-ordering race where a late status poll fires after
+        # the worker closes the serial port but before the tab's _quit is
+        # processed.
+        if status_result is None:
+            return
+
+        status, clock_status, waits_pending = status_result
 
         # Manual mode or aborted
         done_condition = status == 0 or status == 5

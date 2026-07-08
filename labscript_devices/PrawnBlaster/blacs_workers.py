@@ -119,7 +119,19 @@ class PrawnBlasterWorker(Worker):
 
             - **waits_pending** (bool): Indicates if all expected waits have
               not been read out yet.
+
+            Returns ``None`` (sentinel) if the serial port has been closed
+            (e.g. during BLACS shutdown/restart). A late status poll can fire
+            after :py:meth:`shutdown` closes the port but before the tab stops
+            polling; guarding here prevents a ``PortNotOpenError`` write on the
+            closed port. The tab treats a ``None`` result as "no status".
         """
+
+        if not self.prawnblaster.is_open:
+            self.logger.debug(
+                "check_status skipped: serial port is closed (teardown)."
+            )
+            return None
 
         if (
             self.started
